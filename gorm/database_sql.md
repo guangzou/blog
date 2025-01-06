@@ -13,7 +13,7 @@ database/sql 关于数据库驱动模块下各核心 interface 主要包括：
 - **Statement：抽象的请求预处理状态**. 具备实际执行 sql 并返回执行结果的能力
 - **Result/Row**：**抽象的 sql 执行结果**
 
-![database_sql接口关系](..\images\database_sql接口关系.png)
+![database_sql接口关系](../images/database_sql接口关系.png)
 
 ## 1、 抽象接口
 
