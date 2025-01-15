@@ -798,7 +798,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		}
 		db.mu.Unlock()
 
-		// Reset the session if required.是否需要重置连接
+		// Reset the session if required.
 		if err := conn.resetSession(ctx); errors.Is(err, driver.ErrBadConn) {
 			conn.Close()
 			return nil, err
@@ -813,8 +813,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		// Make the connRequest channel. It's buffered so that the
 		// connectionOpener doesn't block while waiting for the req to be read.
 		req := make(chan connRequest, 1)
-		reqKey := db.nextRequestKeyLocked() // 生成请求连接的key
-		db.connRequests[reqKey] = req		// key对应一个通道ch
+		delHandle := db.connRequests.Add(req)
 		db.waitCount++
 		db.mu.Unlock()
 
@@ -826,20 +825,29 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 			// Remove the connection request and ensure no value has been sent
 			// on it after removing.
 			db.mu.Lock()
-			delete(db.connRequests, reqKey)
+			deleted := db.connRequests.Delete(delHandle)
 			db.mu.Unlock()
 
 			db.waitDuration.Add(int64(time.Since(waitStart)))
 
-			select {
-			default:
-			case ret, ok := <-req:
-				if ok && ret.conn != nil {
-					db.putConn(ret.conn, ret.err, false)
+			// If we failed to delete it, that means either the DB was closed or
+			// something else grabbed it and is about to send on it.
+			if !deleted {
+				// TODO(bradfitz): rather than this best effort select, we
+				// should probably start a goroutine to read from req. This best
+				// effort select existed before the change to check 'deleted'.
+				// But if we know for sure it wasn't deleted and a sender is
+				// outstanding, we should probably block on req (in a new
+				// goroutine) to get the connection back.
+				select {
+				default:
+				case ret, ok := <-req:
+					if ok && ret.conn != nil {
+						db.putConn(ret.conn, ret.err, false)
+					}
 				}
 			}
 			return nil, ctx.Err()
-      // 有连接了
 		case ret, ok := <-req:
 			db.waitDuration.Add(int64(time.Since(waitStart)))
 
@@ -852,7 +860,6 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 			// back into the connection pool.
 			// This prioritizes giving a valid connection to a client over the exact connection
 			// lifetime, which could expire exactly after this point anyway.
-      // 判断连接是否已过期
 			if strategy == cachedOrNewConn && ret.err == nil && ret.conn.expired(lifetime) {
 				db.mu.Lock()
 				db.maxLifetimeClosed++
@@ -873,9 +880,9 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		}
 	}
 
-	db.numOpen++ // optimistically 乐观的先++
+	db.numOpen++ // optimistically
 	db.mu.Unlock()
-	ci, err := db.connector.Connect(ctx) // 创建新连接
+	ci, err := db.connector.Connect(ctx)
 	if err != nil {
 		db.mu.Lock()
 		db.numOpen-- // correct for earlier optimism
@@ -884,7 +891,6 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		return nil, err
 	}
 	db.mu.Lock()
-  // 返回包装后的新连接
 	dc := &driverConn{
 		db:         db,
 		createdAt:  nowFunc(),
@@ -908,4 +914,4 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 
 4、未超过则调用其实现类的 connector 创建新连接
 
-<img src="/Users/zouguang/Documents/Study/from_github/blog/images/获取连接.png" style="zoom: 67%;" />
+<img src="../images/获取连接.png"  />
