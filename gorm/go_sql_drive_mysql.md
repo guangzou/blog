@@ -379,11 +379,11 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 
 8、设置 dsn 中的参数变量（mc.handleParams）
 
-![](D:\gocode\github\blog\images\mysql-driver-connect.jpg)
+![](../images/mysql-driver-connect.jpg)
 
 
 
-### **核心设计思想总结**
+**核心设计思想总结**
 
 1. **接口化设计**：实现 `driver.Connector` 接口，与 Go 标准库 `database/sql` 无缝集成。
 2. **分层处理**：将连接过程分解为`网络层、协议层、认证层、参数层`，模块化清晰。
@@ -401,7 +401,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 
 在看跟 mysql 服务端交互逻辑之前，先熟悉 mysql 客户端跟服务端之前的数据交互协议：
 
-![](D:\gocode\github\blog\images\mysql数据协议.jpg)
+![](../images/mysql数据协议.jpg)
 
 - 每笔消息分为请求头和正文两部分
 - **在请求头部分中：**
