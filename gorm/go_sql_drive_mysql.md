@@ -30,7 +30,7 @@ mysql 库实现了 Driver 接口的驱动结构体是 MySQLDriver{}
 
 ```go
 type Driver interface {
-    // 开启一个新的数据库连接
+	// 开启一个新的数据库连接
     Open(name string) (Conn, error)
 }
 ```
@@ -182,25 +182,25 @@ mysqlConn 结构体：
 type mysqlConn struct {
 	buf              buffer			// 读写缓冲区
 	netConn          net.Conn		// 当前活跃的网络连接对象，可能是普通的TCP连接或者TLS加密连接
-	rawConn          net.Conn    // underlying connection when netConn is TLS connection.当 netConn 是 TLS 连接时，保存底层原始 TCP 连接（用于需要绕过 TLS 的场景，如连接超时设置）。比如设置 SO_TIMEOUT 等底层 Socket 参数时需操作 rawConn
-	result           mysqlResult // managed by clearResult() and handleOkPacket().
+	rawConn          net.Conn		// underlying connection when netConn is TLS connection.当 netConn 是 TLS 连接时，保存底层原始 TCP 连接（用于需要绕过 TLS 的场景，如连接超时设置）。比如设置 SO_TIMEOUT 等底层 Socket 参数时需操作 rawConn
+	result           mysqlResult 	// managed by clearResult() and handleOkPacket().
 	cfg              *Config
-	connector        *connector  // 连接器
-	maxAllowedPacket int				 // 服务器允许的最大数据包大小（单位：字节），用于限制客户端发送的单个数据包体积，从服务器握手阶段返回的 																						max_allowed_packet 值初始化
-	maxWriteSize     int				// 客户端单次写入网络的最大数据块大小，用于优化大块数据的分片发送
+	connector        *connector  	// 连接器
+	maxAllowedPacket int		 	// 服务器允许的最大数据包大小（单位：字节），用于限制客户端发送的单个数据包体积，从服务器握手阶段返回的 																						max_allowed_packet 值初始化
+	maxWriteSize     int			// 客户端单次写入网络的最大数据块大小，用于优化大块数据的分片发送
 	writeTimeout     time.Duration	// 写入操作的超时时间
 	flags            clientFlag		// 客户端能力标志位，记录与服务器协商后的支持特性（如是否启用 SSL、是否支持多语句等）
 	status           statusFlag		// 连接状态标志位，表示服务器返回的当前状态（如事务是否活跃、是否有未读取的结果集）
-	sequence         uint8				// 数据包序列号（0~255 循环），用于保证客户端与服务器之间数据包的顺序一致性，递增
+	sequence         uint8			// 数据包序列号（0~255 循环），用于保证客户端与服务器之间数据包的顺序一致性，递增
 	parseTime        bool
 
 	// for context support (Go 1.8+)
-	watching bool						// 标记是否正在通过 watcher 通道监听上下文取消事件
+	watching bool					// 标记是否正在通过 watcher 通道监听上下文取消事件
 	watcher  chan<- context.Context	// 单向通道（只发送），用于向外部通知上下文取消事件
-	closech  chan struct{}		// 通知连接关闭的内部通道。关闭此通道表示连接已终止
-	finished chan<- struct{}	// 单向通道（只发送），用于通知外部调用者连接已完全关闭
-	canceled atomicError // set non-nil if conn is canceled 原子存储的取消错误，记录连接被取消的原因
-	closed   atomicBool  // set when conn is closed, before closech is closed 原子标记连接是否已关闭，避免重复关闭导致的 panic
+	closech  chan struct{}			// 通知连接关闭的内部通道。关闭此通道表示连接已终止
+	finished chan<- struct{}		// 单向通道（只发送），用于通知外部调用者连接已完全关闭
+	canceled atomicError 			// set non-nil if conn is canceled 原子存储的取消错误，记录连接被取消的原因
+	closed   atomicBool  			// set when conn is closed, before closech is closed 原子标记连接是否已关闭，避免重复关闭导致的 panic
 }
 ```
 
@@ -255,7 +255,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	mc.parseTime = mc.cfg.ParseTime
 
 	// Connect to Server
-  // 加读锁，通过全局注册表 dials 支持自定义网络协议（如 TLS 封装）。
+	// 加读锁，通过全局注册表 dials 支持自定义网络协议（如 TLS 封装）。
 	dialsLock.RLock()
 	dial, ok := dials[mc.cfg.Net]
 	dialsLock.RUnlock()
@@ -422,7 +422,7 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 	for {
 		// read packet header 包头
 		data, err := mc.buf.readNext(4)
-        // 读取失败，关闭连接
+		// 读取失败，关闭连接
 		if err != nil {
 			if cerr := mc.canceled.Value(); cerr != nil {
 				return nil, cerr
@@ -433,14 +433,14 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		}
 
 		// packet length [24 bit]
-        // 读前三个字节表示包的长度
+		// 读前三个字节表示包的长度
 		pktLen := int(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16)
 
 		// check packet sync [8 bit]
-        // 校验第四个字节的服务端包序列号是否跟本地的序列号一致
+		// 校验第四个字节的服务端包序列号是否跟本地的序列号一致
 		if data[3] != mc.sequence {
 			mc.Close()
-            // 出现跳包
+			// 出现跳包
             // ErrPktSync = errors.New("commands out of sync. You can't run this command now")
 			// ErrPktSyncMul = errors.New("commands out of sync. Did you run multiple statements at once?")
 			if data[3] > mc.sequence {
@@ -448,15 +448,15 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 			}
 			return nil, ErrPktSync
 		}
-        // 序号递增，一个字节8位最多能表示256个序号，从0到255
+		// 序号递增，一个字节8位最多能表示256个序号，从0到255
 		mc.sequence++
 
 		// packets with length 0 terminate a previous packet which is a
 		// multiple of (2^24)-1 bytes long
-        // 包长为0，说明前面的包都已经读取完成，MySQL 协议规定：0长度包表示分片结束
+		// 包长为0，说明前面的包都已经读取完成，MySQL 协议规定：0长度包表示分片结束
 		if pktLen == 0 {
 			// there was no previous packet
-            // 前面必须要读到数据，没有则报错，关闭连接
+			// 前面必须要读到数据，没有则报错，关闭连接
 			if prevData == nil {
 				mc.log(ErrMalformPkt)
 				mc.Close()
@@ -467,7 +467,7 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		}
 
 		// read packet body [pktLen bytes]
-      	// 读取 pktLen 长度的数据出来
+		// 读取 pktLen 长度的数据出来
 		data, err = mc.buf.readNext(pktLen)
 		if err != nil {
 			if cerr := mc.canceled.Value(); cerr != nil {
@@ -479,10 +479,10 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		}
 
 		// return data if this was the last packet
-        // 如果该包长度小于 2^24 - 1 = 16MB, 则是最后一个包了
+		// 如果该包长度小于 2^24 - 1 = 16MB, 则是最后一个包了
 		if pktLen < maxPacketSize {
 			// zero allocations for non-split packets
-            // 这个 if 表示只有一个小于最大长度的单包，都不要分片，直接读取完成返回
+			// 这个 if 表示只有一个小于最大长度的单包，都不要分片，直接读取完成返回
 			if prevData == nil {
 				return data, nil
 			}
@@ -502,17 +502,17 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 ```go
 // Write packet buffer 'data'
 func (mc *mysqlConn) writePacket(data []byte) error {
-    // 真实数据长度
+	// 真实数据长度
 	pktLen := len(data) - 4
 	
-    // 大于最大允许的包长度
+	// 大于最大允许的包长度
 	if pktLen > mc.maxAllowedPacket {
 		return ErrPktTooLarge
 	}
 
 	for {
 		var size int
-        // 该包已经超过单个包的大小上限 16MB 了
+		// 该包已经超过单个包的大小上限 16MB 了
 		if pktLen >= maxPacketSize {
 			data[0] = 0xff
 			data[1] = 0xff
@@ -527,7 +527,7 @@ func (mc *mysqlConn) writePacket(data []byte) error {
 		data[3] = mc.sequence
 
 		// Write packet
-        // 写超时时间
+		// 写超时时间
 		if mc.writeTimeout > 0 {
 			if err := mc.netConn.SetWriteDeadline(time.Now().Add(mc.writeTimeout)); err != nil {
 				return err
@@ -536,20 +536,20 @@ func (mc *mysqlConn) writePacket(data []byte) error {
 		// 写4+size 长度数据到网络中
 		n, err := mc.netConn.Write(data[:4+size])
 		if err == nil && n == 4+size {
-            // 写成功序列号加1
+			// 写成功序列号加1
 			mc.sequence++
-            // 单包小于 16 MB，已经写完了直接返回即可
+			// 单包小于 16 MB，已经写完了直接返回即可
 			if size != maxPacketSize {
 				return nil
 			}
-            // 否则，则计算剩余包长度
+			// 否则，则计算剩余包长度
 			pktLen -= size
 			data = data[size:]
 			continue
 		}
 
 		// Handle error
-        // 属于没 err 但是 n != len(data)
+		// 属于没 err 但是 n != len(data)
 		if err == nil {
 			mc.cleanup()
 			mc.log(ErrMalformPkt)
