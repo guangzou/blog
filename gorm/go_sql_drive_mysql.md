@@ -361,6 +361,26 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 
 ```
 
+整体步骤：
+
+1、创建连接（net.Dialer.DialContext）
+
+2、设置为 tcp 长连接（net.TCPConn.KeepAlive）
+
+3、创建连接缓冲区（mc.buf = newBuffer）
+
+4、设置连接超时配置（mc.buf.timeout = mc.cfg.ReadTimeout；mc.writeTimeout = mc.cfg.WriteTimeout）
+
+5、接收来自服务端的握手请求（mc.readHandshakePacket）
+
+6、向服务端发起鉴权请求（mc.writeHandshakeResponsePacket）
+
+7、处理鉴权结果（mc.handleAuthResult）
+
+8、设置 dsn 中的参数变量（mc.handleParams）
+
+![](D:\gocode\github\blog\images\mysql-driver-connect.jpg)
+
 
 
 ### **核心设计思想总结**
@@ -376,3 +396,177 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 5. **健壮性**：
    - 认证失败自动回退机制。
    - TCP Keepalive 和超时设置防止网络故障。
+
+
+
+在看跟 mysql 服务端交互逻辑之前，先熟悉 mysql 客户端跟服务端之前的数据交互协议：
+
+![](D:\gocode\github\blog\images\mysql数据协议.jpg)
+
+- 每笔消息分为请求头和正文两部分
+- **在请求头部分中：**
+- **前三个字节对应的是消息正文长度**，共 24 个 bit 位，表示的长度最大值为 2^24 - 1，因此消息最大长度为 16MB-1byte. 如果消息长度大于该阈值，则需要进行分包
+- **第四个字节对应为请求的 sequence 序列号**. 一个新的客户端从 0 开始依次递增序列号，每次读消息时，会对序列号进行校验，要求必须必须和本地序号保持一致
+- **在正文部分中：**
+- **对于客户端接收服务端消息的场景，首个字节标识了这条消息的状态.** 倘若为 0，代表响应成功；倘若为 255，代表有错误发生；其他枚举值含义此处不再赘述
+- **对于客户端发送消息到服务端的场景，首个字节标识了这笔请求的类型**. 首个字节代表的是 sql 指令的类型。
+
+
+
+读数据包：
+
+```go
+// Read packet to buffer 'data'
+func (mc *mysqlConn) readPacket() ([]byte, error) {
+	var prevData []byte		// 存数据包分片的缓冲区
+	for {
+		// read packet header 包头
+		data, err := mc.buf.readNext(4)
+        // 读取失败，关闭连接
+		if err != nil {
+			if cerr := mc.canceled.Value(); cerr != nil {
+				return nil, cerr
+			}
+			mc.log(err)
+			mc.Close()
+			return nil, ErrInvalidConn
+		}
+
+		// packet length [24 bit]
+        // 读前三个字节表示包的长度
+		pktLen := int(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16)
+
+		// check packet sync [8 bit]
+        // 校验第四个字节的服务端包序列号是否跟本地的序列号一致
+		if data[3] != mc.sequence {
+			mc.Close()
+            // 出现跳包
+            // ErrPktSync = errors.New("commands out of sync. You can't run this command now")
+			// ErrPktSyncMul = errors.New("commands out of sync. Did you run multiple statements at once?")
+			if data[3] > mc.sequence {
+				return nil, ErrPktSyncMul
+			}
+			return nil, ErrPktSync
+		}
+        // 序号递增，一个字节8位最多能表示256个序号，从0到255
+		mc.sequence++
+
+		// packets with length 0 terminate a previous packet which is a
+		// multiple of (2^24)-1 bytes long
+        // 包长为0，说明前面的包都已经读取完成，MySQL 协议规定：0长度包表示分片结束
+		if pktLen == 0 {
+			// there was no previous packet
+            // 前面必须要读到数据，没有则报错，关闭连接
+			if prevData == nil {
+				mc.log(ErrMalformPkt)
+				mc.Close()
+				return nil, ErrInvalidConn
+			}
+			// 返回成功读取的数据
+			return prevData, nil
+		}
+
+		// read packet body [pktLen bytes]
+      	// 读取 pktLen 长度的数据出来
+		data, err = mc.buf.readNext(pktLen)
+		if err != nil {
+			if cerr := mc.canceled.Value(); cerr != nil {
+				return nil, cerr
+			}
+			mc.log(err)
+			mc.Close()
+			return nil, ErrInvalidConn
+		}
+
+		// return data if this was the last packet
+        // 如果该包长度小于 2^24 - 1 = 16MB, 则是最后一个包了
+		if pktLen < maxPacketSize {
+			// zero allocations for non-split packets
+            // 这个 if 表示只有一个小于最大长度的单包，都不要分片，直接读取完成返回
+			if prevData == nil {
+				return data, nil
+			}
+			// 追加最后一个包到buf中，返回
+			return append(prevData, data...), nil
+		}
+		// 追加该包到buf中，继续读取剩余的数据
+		prevData = append(prevData, data...)
+	}
+}
+```
+
+
+
+写数据包到缓存区：
+
+```go
+// Write packet buffer 'data'
+func (mc *mysqlConn) writePacket(data []byte) error {
+    // 真实数据长度
+	pktLen := len(data) - 4
+	
+    // 大于最大允许的包长度
+	if pktLen > mc.maxAllowedPacket {
+		return ErrPktTooLarge
+	}
+
+	for {
+		var size int
+        // 该包已经超过单个包的大小上限 16MB 了
+		if pktLen >= maxPacketSize {
+			data[0] = 0xff
+			data[1] = 0xff
+			data[2] = 0xff
+			size = maxPacketSize
+		} else {
+			data[0] = byte(pktLen)
+			data[1] = byte(pktLen >> 8)
+			data[2] = byte(pktLen >> 16)
+			size = pktLen
+		}
+		data[3] = mc.sequence
+
+		// Write packet
+        // 写超时时间
+		if mc.writeTimeout > 0 {
+			if err := mc.netConn.SetWriteDeadline(time.Now().Add(mc.writeTimeout)); err != nil {
+				return err
+			}
+		}
+		// 写4+size 长度数据到网络中
+		n, err := mc.netConn.Write(data[:4+size])
+		if err == nil && n == 4+size {
+            // 写成功序列号加1
+			mc.sequence++
+            // 单包小于 16 MB，已经写完了直接返回即可
+			if size != maxPacketSize {
+				return nil
+			}
+            // 否则，则计算剩余包长度
+			pktLen -= size
+			data = data[size:]
+			continue
+		}
+
+		// Handle error
+        // 属于没 err 但是 n != len(data)
+		if err == nil {
+			mc.cleanup()
+			mc.log(ErrMalformPkt)
+		} else {
+			if cerr := mc.canceled.Value(); cerr != nil {
+				return cerr
+			}
+			if n == 0 && pktLen == len(data)-4 {
+				// only for the first loop iteration when nothing was written yet
+				return errBadConnNoWrite
+			}
+			mc.cleanup()
+			mc.log(err)
+		}
+		return ErrInvalidConn
+	}
+}
+```
+
+读写数据都遵循着数据包的协议格式。
