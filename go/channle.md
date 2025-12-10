@@ -46,7 +46,7 @@ type sudog struct {
 }
 ```
 
-![img](https://cdn.nlark.com/yuque/0/2024/png/21729289/1733220487891-f3a6320e-7bc0-4c18-b40a-800a1c2af4e8.png)
+![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan内部数据结构.png)
 
 # 2、构造函数
 
@@ -297,13 +297,13 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 }
 ```
 
-![img](https://cdn.nlark.com/yuque/0/2024/png/21729289/1733220725236-264fe5f5-6054-4c01-96c5-b62ca7007212.png)
+![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan写操作.png)
 
 
 
 阻塞发送：
 
-![img](https://cdn.nlark.com/yuque/0/2024/png/21729289/1733220794495-44ee6beb-487c-4c37-a6d5-1d1671d071a6.png)
+![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan阻塞发送.png)
 
 ## 3.1 参数解释：
 
@@ -364,7 +364,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 
 12）唤醒后检查，若通道关闭，则 panic
 
-![img](https://cdn.nlark.com/yuque/0/2024/png/21729289/1733192095303-088ed918-eea6-4081-b47c-c33583e2535a.png)
+![img](../images/写chan流程.png)
 
 
 
@@ -659,7 +659,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 }
 ```
 
-![img](https://cdn.nlark.com/yuque/0/2024/png/21729289/1733221011216-03c1a66c-5497-4a3e-9bee-bcebfe6de335.png)
+![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan缓冲区读取.png)
 
 ## 4.1 参数解释
 
