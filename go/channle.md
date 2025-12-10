@@ -46,7 +46,7 @@ type sudog struct {
 }
 ```
 
-![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan内部数据结构.png)
+![img](../images/chan内部数据结构.png)
 
 # 2、构造函数
 
@@ -297,13 +297,13 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 }
 ```
 
-![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan写操作.png)
+![img](../images/chan写操作.png)
 
 
 
 阻塞发送：
 
-![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan阻塞发送.png)
+![img](../images/chan阻塞发送.png)
 
 ## 3.1 参数解释：
 
@@ -659,7 +659,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 }
 ```
 
-![img](/Users/zouguang/Documents/Study/from_github/blog/images/chan缓冲区读取.png)
+![img](../images/chan缓冲区读取.png)
 
 ## 4.1 参数解释
 
