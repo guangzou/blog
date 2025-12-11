@@ -166,13 +166,123 @@ ok:
 	RET
 ```
 
-这个汇编函数主要做了三件事：
+这个汇编函数主要做了四件事：
 
-- 通过 runtime 中的 osinit、schedinit 等函数对 golang 运行时进行初始化，包括 GMP 的初始化，与调度逻辑。其中 osinit 主要是获取 CPU 数量，页大小等一些操作系统初始化工作。
+- 建立 goroutine（g0）和 machine（m0）的双向关联，g0 是初始 goroutine，m0 是初始 OS 线程，它使用操作系统提供的初始线程栈（通常是主线程栈）
 
-- 创建一个主协程，并指明 runtime.main 函数是其入口函数，runtime.main 最终会调用用户的 main.main()，操作系统加载的时候只创建好了主线程，协程还是得用户态的 golang 自己管理，在这里 golang 创建出了自己的第一个协程。
+- 通过 runtime 中的 osinit、schedinit 等函数对 GMP 初始化。其中 osinit 主要是获取 CPU 数量，页大小等一些操作系统初始化工作
 
-- 调用 runtime·mstart 真正开启运行。
+- 创建一个新的 goroutine 来运行 runtime.main，runtime.main 最终会调用用户的 main.main()，操作系统加载的时候只创建好了主线程，协程还是得用户态的 golang 自己管理，在这里 golang 创建出了自己的第一个协程
+
+- 调用 runtime·mstart 开启调度
+
+
+
+### 2.1 m0 和 g0 初始化过程
+
+m0 和 g0 的初始化过程：
+
+```shell
+// 建立 goroutine（g0）和 machine（m0）的双向关联，g0 是初始 goroutine，m0 是初始 OS 线程，使用操作系统提	 // 供的初始线程栈（通常是主线程栈）
+	// set the per-goroutine and per-mach "registers"
+	get_tls(BX)
+	LEAQ	runtime·g0(SB), CX   // 将全局变量 g0 的地址加载到 CX 寄存器，此时 CX 指向 g0 结构体
+	MOVQ	CX, g(BX)						 //g(BX)宏展开为 0(r)(TLS*1)，即将 CX (g0 的地址)存储到 TLS 的第一个槽位
+	LEAQ	runtime·m0(SB), AX   // 将全局变量 m0 的地址加载到 AX 寄存器
+
+	// save m->g0 = g0
+	MOVQ	CX, m_g0(AX)
+	// save m0 to g0->m
+	MOVQ	AX, g_m(CX)
+```
+
+get_tls(BX):将 TLS 基地址加载到 BX 寄存器，TLS 代表当前线程的线程本地存储区域的基地址。
+
+```shell
+// get_tls(r) 在 go_tls.h 中定义
+
+#ifdef GOARCH_amd64
+#define	get_tls(r)	MOVQ TLS, r
+#define	g(r)	0(r)(TLS*1)
+#endif
+```
+
+将全局变量 g0 的地址加载到 CX 寄存器，此时 CX 指向 g0 结构体
+
+```shell
+LEAQ	runtime·g0(SB), CX
+```
+
+g(BX)函数展开为 0(r)(TLS*1)，即将 CX (g0 的地址)存储到 TLS 的第一个槽位,从此刻起，getg() 函数就能工作了
+
+```shell
+MOVQ	CX, g(BX)
+
+--------------------
+// getg()的定义如下
+// getg returns the pointer to the current g.
+// The compiler rewrites calls to this function into instructions
+// that fetch the g directly (from TLS or from the dedicated register).
+func getg() *g
+```
+
+将全局变量 m0 的地址加载到 AX 寄存器
+
+```shell
+LEAQ	runtime·m0(SB), AX
+```
+
+此时的寄存器状态：
+
+```shell
+BX = TLS 基地址
+CX = &g0
+AX = &m0
+```
+
+m->g0 = g0
+
+```shell
+MOVQ	CX, m_g0(AX)
+```
+
+g0->m = m0
+
+```shell
+MOVQ	AX, g_m(CX)
+```
+
+完成 m0 和 g0 的相互引用，通过 TLS，能够快速访问 GMP 的调度链
+
+┌─────────────────────────────────────┐
+│  当前线程（M）                        │
+├─────────────────────────────────────┤
+│  TLS[0] → 当前 G                     │
+│           ↓                          │
+│           g.m → 当前 M               │
+│                 ↓                    │
+│                 m.p → 当前 P         │
+│                       ↓              │
+│                       p.runq → G队列 │
+└─────────────────────────────────────┘
+
+
+
+![m0&g0](../images/m0&g0.png)
+
+
+
+使用 TLS 的好处：
+
+1、通过 TLS，getg() 可以在几个 CPU 周期内完成，无需函数调用开销。
+
+2、支持多线程每个操作系统线程（M）都有自己的 TLS：M1 的 TLS[0] 指向它当前运行的 G；M2 的 TLS[0] 指向它当前运行的 G。互不干扰，无需加锁。
+
+3、架构无关的抽象：不同操作系统和 CPU 架构的 TLS 实现不同，通过 get_tls 宏和 g(r) 宏抽象了这些差异。
+
+
+
+### 2.2 schedinit()调度系统初始化
 
 
 
@@ -256,7 +366,7 @@ func schedinit() {
 		//    just numCPUStartup).
 		procs = defaultGOMAXPROCS(numCPUStartup)
 	}
-  // 调用 procresize 创建 P（处理器）
+  // 调用 procresize 调整 P（处理器）
 	if procresize(procs) != nil {
 		throw("unknown runnable goroutine during bootstrap")
 	}
@@ -273,7 +383,7 @@ P 的数量取决于当前 cpu 的数量，或者是 runtime.GOMAXPROCS 的配�
 几个重点：
 
 1. mallocinit()：内存分配器，初始化 mcache（每个 P 的本地缓存），分三级mcache、mcentral（中心缓存）、mheap（全局堆），在此之前不能进行堆内存分配
-2. mcommoninit(gp.m, -1)：完善初始化当前 M（M0，主线程），将 M 加入全局 M 列表，前面 M0 已经存在：作为全局变量静态分配且在 rt0_go 汇编中与 g0 建立了关联，g0 和 m0 不是通过 malloc 动态分配的，而是编译时就分配好的静态内存，解决了“鸡生蛋”问题（在内存分配器初始化之前，我们需要一个 M 和 G 来运行初始化代码）
+2. mcommoninit(gp.m, -1)：完善初始化当前 M（M0，主线程），将 M 加入全局 M 列表。前面 M0 已经存在：作为全局变量静态分配且在 rt0_go 汇编中与 g0 建立了关联，g0 和 m0 不是通过 malloc 动态分配的，而是编译时就分配好的静态内存，解决了“鸡生蛋”问题（在内存分配器初始化之前，我们需要一个 M 和 G 来运行初始化代码）
 3. gcinit()：初始化垃圾回收器的数据结构、工作线程、写屏障等
 4. GOMAXPROCS 初始化
 5. procresize(procs): 调整 P 的数目和 P 处理器的初始化。
@@ -283,6 +393,8 @@ P 的数量取决于当前 cpu 的数量，或者是 runtime.GOMAXPROCS 的配�
 重点看下`procresize(procs)`:
 
 ```go
+var allp []*p
+
 // Change number of processors.
 //
 // sched.lock must be held, and the world must be stopped.
@@ -316,7 +428,7 @@ func procresize(nprocs int32) *p {
 		if pp == nil {
 			pp = new(p)
 		}
-		pp.init(i)
+		pp.init(i)  // 设置id，初始化mcahe，设置状态为_Pgcstop
 		atomicstorep(unsafe.Pointer(&allp[i]), unsafe.Pointer(pp))
 	}
 
@@ -335,7 +447,7 @@ func procresize(nprocs int32) *p {
 			gp.m.p.ptr().m = 0
 		}
 		gp.m.p = 0
-		pp := allp[0]
+		pp := allp[0]		// 取第一个P
 		pp.m = 0
 		pp.status = _Pidle
 		acquirep(pp)
@@ -359,7 +471,8 @@ func procresize(nprocs int32) *p {
 		timerpMask = timerpMask[:maskWords]
 		unlock(&allpLock)
 	}
-
+	
+  // id 大于nprocs的 P 都不返回了
 	var runnablePs *p
 	for i := nprocs - 1; i >= 0; i-- {
 		pp := allp[i]
@@ -375,11 +488,243 @@ func procresize(nprocs int32) *p {
 			runnablePs = pp
 		}
 	}
-	stealOrder.reset(uint32(nprocs))
+	stealOrder.reset(uint32(nprocs))  // 更新窃取其他 P 本地队列的 order
 	var int32p *int32 = &gomaxprocs // make compiler check that gomaxprocs is an int32
 	atomic.Store((*uint32)(unsafe.Pointer(int32p)), uint32(nprocs))
 
-	return runnablePs
+	return runnablePs  // 返回可用的 P 链表头指针
+}
+
+func wirep(pp *p) {
+	gp := getg()
+
+	if gp.m.p != 0 {
+		systemstack(func() {
+			throw("wirep: already in go")
+		})
+	}
+	if pp.m != 0 || pp.status != _Pidle {
+		systemstack(func() {
+			id := int64(0)
+			if pp.m != 0 {
+				id = pp.m.ptr().id
+			}
+			print("wirep: p->m=", pp.m, "(", id, ") p->status=", pp.status, "\n")
+			throw("wirep: invalid p state")
+		})
+	}
+	gp.m.p.set(pp)  // 当前 m 关联 p
+	pp.m.set(gp.m)  // p 关联当前 m
+	pp.status = _Prunning
+}
+
+// 乐观无锁+双重检查判队列是否为空，for循环不会一直进行下去:1、时间窗口极窄，三条原子操作只有几纳秒；2、runqtail有限次变化（p的本地队列长度有限，256），单个 P 每秒最多处理 数百万次 队列操作，但在 5 纳秒的窗口内，最多只能发生 1-2 次 修改
+// runqempty reports whether pp has no Gs on its local run queue.
+// It never returns true spuriously.
+func runqempty(pp *p) bool {
+	// Defend against a race where 1) pp has G1 in runqnext but runqhead == runqtail,
+	// 2) runqput on pp kicks G1 to the runq, 3) runqget on pp empties runqnext.
+	// Simply observing that runqhead == runqtail and then observing that runqnext == nil
+	// does not mean the queue is empty.
+	for {
+		head := atomic.Load(&pp.runqhead)
+		tail := atomic.Load(&pp.runqtail)
+		runnext := atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&pp.runnext)))
+		if tail == atomic.Load(&pp.runqtail) {
+			return head == tail && runnext == 0
+		}
+	}
+}
+
+func pidleput(pp *p, now int64) int64 {
+	assertLockHeld(&sched.lock)
+
+	if !runqempty(pp) {
+		throw("pidleput: P has non-empty run queue")
+	}
+	if now == 0 {
+		now = nanotime()
+	}
+	if pp.timers.len.Load() == 0 {
+		timerpMask.clear(pp.id)
+	}
+	idlepMask.set(pp.id)
+	pp.link = sched.pidle
+	sched.pidle.set(pp)
+	sched.npidle.Add(1)
+	if !pp.limiterEvent.start(limiterEventIdle, now) {
+		throw("must be able to track idle limiter event")
+	}
+	return now
+}
+```
+
+执行完 acquirep(pp) 后此时 m0 与 g0，p0 的关系就建立起来了。
+
+![Clipboard_Screenshot_1765446771](../images/g0m0p0.png)
+
+此后，构建 p 的空闲单向链表，更新 sched 结构体的空闲 p 链表头节点指针和空闲的 p 数目。其中 sched.pidle：全局唯一的链表头指针，存储在调度器结构体中；p.link：每个 P 结构体内部的字段，用于串联成链表，使用头插法（LIFO - 后进先出），这样头插法和头取出都是 O(1) 时间复杂度，且不需要尾指针。
+
+
+
+![sched_pidle](../images/sched_pidle.png)
+
+
+
+### 2.3 创建 main goroutine
+
+```c
+	// 创建一个新的 goroutine 来运行 runtime.main，runtime.main 最终会调用用户的 main.main()
+	// create a new goroutine to start program
+	MOVQ	$runtime·mainPC(SB), AX		// runtime·mainPC 是一个全局变量，存储了 runtime.main 函数的地址
+	PUSHQ	AX												// 将 mainPC 压栈作为参数
+	CALL	runtime·newproc(SB)
+	POPQ	AX
+
+    
+// mainPC is a function value for runtime.main, to be passed to newproc.
+// The reference to runtime.main is made via ABIInternal, since the
+// actual function (not the ABI0 wrapper) is needed by newproc.
+DATA	runtime·mainPC+0(SB)/8,$runtime·main<ABIInternal>(SB)
+GLOBL	runtime·mainPC(SB),RODATA,$8
+    
+等价于：
+// 只读全局变量，存储 runtime.main 函数的地址
+var mainPC = (*funcval)(unsafe.Pointer(&runtime.main))
+```
+
+
+
+调用 newproc():
+
+```go
+// Create a new g running fn.
+// Put it on the queue of g's waiting to run.
+// The compiler turns a go statement into a call to this.
+func newproc(fn *funcval) {
+	gp := getg()
+	pc := sys.GetCallerPC()
+	systemstack(func() {
+		newg := newproc1(fn, gp, pc, false, waitReasonZero)
+
+		pp := getg().m.p.ptr()
+		runqput(pp, newg, true)
+
+		if mainStarted {
+			wakep()
+		}
+	})
+}
+
+// Create a new g in state _Grunnable (or _Gwaiting if parked is true), starting at fn.
+// callerpc is the address of the go statement that created this. The caller is responsible
+// for adding the new g to the scheduler. If parked is true, waitreason must be non-zero.
+func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreason waitReason) *g {
+	if fn == nil {
+		fatal("go of nil func value")
+	}
+
+	mp := acquirem() // disable preemption because we hold M and P in local vars.
+	pp := mp.p.ptr()
+	newg := gfget(pp)
+	if newg == nil {
+		newg = malg(stackMin)
+		casgstatus(newg, _Gidle, _Gdead)
+		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
+	}
+	if newg.stack.hi == 0 {
+		throw("newproc1: newg missing stack")
+	}
+
+	if readgstatus(newg) != _Gdead {
+		throw("newproc1: new g is not Gdead")
+	}
+
+	totalSize := uintptr(4*goarch.PtrSize + sys.MinFrameSize) // extra space in case of reads slightly beyond frame
+	totalSize = alignUp(totalSize, sys.StackAlign)
+	sp := newg.stack.hi - totalSize
+	if usesLR {
+		// caller's LR
+		*(*uintptr)(unsafe.Pointer(sp)) = 0
+		prepGoExitFrame(sp)
+	}
+	if GOARCH == "arm64" {
+		// caller's FP
+		*(*uintptr)(unsafe.Pointer(sp - goarch.PtrSize)) = 0
+	}
+
+	memclrNoHeapPointers(unsafe.Pointer(&newg.sched), unsafe.Sizeof(newg.sched))
+	newg.sched.sp = sp
+	newg.stktopsp = sp
+	newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum // +PCQuantum so that previous instruction is in same function
+	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	gostartcallfn(&newg.sched, fn)
+	newg.parentGoid = callergp.goid
+	newg.gopc = callerpc
+	newg.ancestors = saveAncestors(callergp)
+	newg.startpc = fn.fn
+	newg.runningCleanups.Store(false)
+	if isSystemGoroutine(newg, false) {
+		sched.ngsys.Add(1)
+	} else {
+		// Only user goroutines inherit synctest groups and pprof labels.
+		newg.bubble = callergp.bubble
+		if mp.curg != nil {
+			newg.labels = mp.curg.labels
+		}
+		if goroutineProfile.active {
+			// A concurrent goroutine profile is running. It should include
+			// exactly the set of goroutines that were alive when the goroutine
+			// profiler first stopped the world. That does not include newg, so
+			// mark it as not needing a profile before transitioning it from
+			// _Gdead.
+			newg.goroutineProfiled.Store(goroutineProfileSatisfied)
+		}
+	}
+	// Track initial transition?
+	newg.trackingSeq = uint8(cheaprand())
+	if newg.trackingSeq%gTrackingPeriod == 0 {
+		newg.tracking = true
+	}
+	gcController.addScannableStack(pp, int64(newg.stack.hi-newg.stack.lo))
+
+	// Get a goid and switch to runnable. Make all this atomic to the tracer.
+	trace := traceAcquire()
+	var status uint32 = _Grunnable
+	if parked {
+		status = _Gwaiting
+		newg.waitreason = waitreason
+	}
+	if pp.goidcache == pp.goidcacheend {
+		// Sched.goidgen is the last allocated id,
+		// this batch must be [sched.goidgen+1, sched.goidgen+GoidCacheBatch].
+		// At startup sched.goidgen=0, so main goroutine receives goid=1.
+		pp.goidcache = sched.goidgen.Add(_GoidCacheBatch)
+		pp.goidcache -= _GoidCacheBatch - 1
+		pp.goidcacheend = pp.goidcache + _GoidCacheBatch
+	}
+	newg.goid = pp.goidcache
+	casgstatus(newg, _Gdead, status)
+	pp.goidcache++
+	newg.trace.reset()
+	if trace.ok() {
+		trace.GoCreate(newg, newg.startpc, parked)
+		traceRelease(trace)
+	}
+
+	// Set up race context.
+	if raceenabled {
+		newg.racectx = racegostart(callerpc)
+		newg.raceignore = 0
+		if newg.labels != nil {
+			// See note in proflabel.go on labelSync's role in synchronizing
+			// with the reads in the signal handler.
+			racereleasemergeg(newg, unsafe.Pointer(&labelSync))
+		}
+	}
+	releasem(mp)
+
+	return newg
 }
 ```
 
@@ -387,108 +732,15 @@ func procresize(nprocs int32) *p {
 
 
 
+
+
+### 2.4 启动 GMP 调度循环
+
+
+
+
+
 ## 其他
-
-
-
-m0 和 g0 的初始化过程：
-
-```shell
-// 建立 goroutine（g0）和 machine（m0）的双向关联，g0 是初始 goroutine，m0 是初始 OS 线程，使用操作系统提	 // 供的初始线程栈（通常是主线程栈）
-	// set the per-goroutine and per-mach "registers"
-	get_tls(BX)
-	LEAQ	runtime·g0(SB), CX   // 将全局变量 g0 的地址加载到 CX 寄存器，此时 CX 指向 g0 结构体
-	MOVQ	CX, g(BX)						 //g(BX)宏展开为 0(r)(TLS*1)，即将 CX (g0 的地址)存储到 TLS 的第一个槽位
-	LEAQ	runtime·m0(SB), AX   // 将全局变量 m0 的地址加载到 AX 寄存器
-
-	// save m->g0 = g0
-	MOVQ	CX, m_g0(AX)
-	// save m0 to g0->m
-	MOVQ	AX, g_m(CX)
-```
-
-get_tls(BX):将 TLS 基地址加载到 BX 寄存器，TLS 代表当前线程的线程本地存储区域的基地址。
-
-为什么需要 TLS？
-
-- Go 运行时需要快速访问当前 goroutine 的 G 结构体
-- 每个操作系统线程（M）都需要知道它当前正在运行哪个 G
-- TLS 提供了一种高效的机制，无需函数参数传递就能获取当前 G
-
-```shell
-// 在 go_tls.h 中定义
-
-#ifdef GOARCH_amd64
-#define	get_tls(r)	MOVQ TLS, r
-#define	g(r)	0(r)(TLS*1)
-#endif
-```
-
-将全局变量 g0 的地址加载到 CX 寄存器，此时 CX 指向 g0 结构体
-
-```shell
-LEAQ	runtime·g0(SB), CX
-```
-
-g(BX)函数展开为 0(r)(TLS*1)，即将 CX (g0 的地址)存储到 TLS 的第一个槽位,从此刻起，getg() 函数就能工作了
-
-```shell
-MOVQ	CX, g(BX)
-```
-
-将全局变量 m0 的地址加载到 AX 寄存器
-
-```shell
-LEAQ	runtime·m0(SB), AX
-```
-
-此时的寄存器状态：
-
-```shell
-BX = TLS 基地址
-CX = &g0
-AX = &m0
-```
-
-m->g0 = g0
-
-```shell
-MOVQ	CX, m_g0(AX)
-```
-
-g0->m = m0
-
-```shell
-MOVQ	AX, g_m(CX)
-```
-
-完成 m0 和 g0 的相互引用，通过 TLS，能够快速访问 GMP 的调度链
-
-┌─────────────────────────────────────┐
-│  当前线程（M）                        │
-├─────────────────────────────────────┤
-│  TLS[0] → 当前 G                     │
-│           ↓                          │
-│           g.m → 当前 M               │
-│                 ↓                    │
-│                 m.p → 当前 P         │
-│                       ↓              │
-│                       p.runq → G队列 │
-└─────────────────────────────────────┘
-
-
-
-![m0&g0](../images/m0&g0.png)
-
-
-
-使用 TLS 的好处：
-
-1、通过 TLS，getg() 可以在几个 CPU 周期内完成，无需函数调用开销。
-
-2、支持多线程每个操作系统线程（M）都有自己的 TLS：M1 的 TLS[0] 指向它当前运行的 G；M2 的 TLS[0] 指向它当前运行的 G。互不干扰，无需加锁。
-
-3、架构无关的抽象：不同操作系统和 CPU 架构的 TLS 实现不同，通过 get_tls 宏和 g(r) 宏抽象了这些差异。
 
 
 
