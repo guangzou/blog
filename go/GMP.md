@@ -22,7 +22,7 @@ go 语言中的协程是 goroutine，能够与 M、P动态结合，体积只有�
 
 **G**
 
-goroutine，是 golang 中对协程的抽象；有自己的运行栈、生命周期状态、以及执行的任务函数（用户通过 go func 指定）；需要绑定在 m 上执行，
+goroutine，是 golang 中对协程的抽象；有自己的运行栈、生命周期状态、以及执行的任务函数（用户通过 go func 指定）；需要绑定在 m 上执行。
 
 
 
@@ -52,7 +52,7 @@ p 维护在一个 p 列表中，最大数目由 GOMAXPROCS 决定，可通过环
 
 将 g 放入容器和取出容器的流程设计：
 
-- put g：当某个 g 中通过 go func(){...} 操作创建子 g 时，会先尝试将子 g 添加到当前所在 p 的 lrq 中（无锁化）；如果 lrq 满了，则会将 g 追加到 grq 中（全局锁）. 此处采取的思路是`“就近原则”`
+- put g：当某个 g 中通过 go func(){...} 操作创建子 g 时，会先尝试将子 g 添加到当前所在 p 的 lrq 中（无锁化）；如果 lrq 满了，则会将 g 追加到 grq 中（全局锁）。
 
 - get g：gmp 调度流程中，m 和 p 结合后，运行的 g0 会不断寻找合适的 g 用于执行，此时会采取`“负载均衡”`的思路，遵循如下实施步骤：
 
@@ -595,7 +595,7 @@ var mainPC = (*funcval)(unsafe.Pointer(&runtime.main))
 
 
 
-调用 newproc():
+调用 newproc()，当写 go func() 时，编译器会将其转换为对 newproc 的调用。
 
 ```go
 // Create a new g running fn.
@@ -615,11 +615,46 @@ func newproc(fn *funcval) {
 		}
 	})
 }
+```
 
+#### 2.3.1 systemstack切换g0栈
+
+systemstack()，切换系统栈，保存当前 goroutine 的上下文，如果已经在 g0 或 gsignal 上，则直接执行，否则切换到 g0 栈，执行传入的函数，执行完毕后恢复原来的 goroutine 上下文。
+
+```go
+// systemstack runs fn on a system stack.
+// If systemstack is called from the per-OS-thread (g0) stack, or
+// if systemstack is called from the signal handling (gsignal) stack,
+// systemstack calls fn directly and returns.
+// Otherwise, systemstack is being called from the limited stack
+// of an ordinary goroutine. In this case, systemstack switches
+// to the per-OS-thread stack, calls fn, and switches back.
+// It is common to use a func literal as the argument, in order
+// to share inputs and outputs with the code around the call
+// to system stack:
+//
+//	... set up y ...
+//	systemstack(func() {
+//		x = bigcall(y)
+//	})
+//	... use x ...
+//
+//go:noescape
+func systemstack(fn func())
+```
+
+系统栈（g0 栈）上执行，空间更大，不会栈增长，避免在用户 goroutine 栈上执行可能因为栈增长的操作，导致的递归问题；不会触发 GC 扫描（g0 的栈不需要扫描），安全地操作 schd 调度器数据结构，不会被抢占，为 runtime 提供了一个稳定、安全、高效的执行环境。
+
+
+
+#### 2.3.2 新建一个 goroutine
+
+```go
 // Create a new g in state _Grunnable (or _Gwaiting if parked is true), starting at fn.
 // callerpc is the address of the go statement that created this. The caller is responsible
 // for adding the new g to the scheduler. If parked is true, waitreason must be non-zero.
 func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreason waitReason) *g {
+  // 防止创建一个没有执行函数的 goroutine，var f func() 和 go f() 等会触发 fatal error
 	if fn == nil {
 		fatal("go of nil func value")
 	}
@@ -639,98 +674,209 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	if readgstatus(newg) != _Gdead {
 		throw("newproc1: new g is not Gdead")
 	}
-
-	totalSize := uintptr(4*goarch.PtrSize + sys.MinFrameSize) // extra space in case of reads slightly beyond frame
+	// g结构体的各个字段值的赋值
+	totalSize := uintptr(4*goarch.PtrSize + sys.MinFrameSize)
 	totalSize = alignUp(totalSize, sys.StackAlign)
 	sp := newg.stack.hi - totalSize
-	if usesLR {
-		// caller's LR
-		*(*uintptr)(unsafe.Pointer(sp)) = 0
-		prepGoExitFrame(sp)
-	}
-	if GOARCH == "arm64" {
-		// caller's FP
-		*(*uintptr)(unsafe.Pointer(sp - goarch.PtrSize)) = 0
-	}
-
 	memclrNoHeapPointers(unsafe.Pointer(&newg.sched), unsafe.Sizeof(newg.sched))
 	newg.sched.sp = sp
 	newg.stktopsp = sp
-	newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum // +PCQuantum so that previous instruction is in same function
+	newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum
 	newg.sched.g = guintptr(unsafe.Pointer(newg))
 	gostartcallfn(&newg.sched, fn)
 	newg.parentGoid = callergp.goid
 	newg.gopc = callerpc
 	newg.ancestors = saveAncestors(callergp)
 	newg.startpc = fn.fn
-	newg.runningCleanups.Store(false)
-	if isSystemGoroutine(newg, false) {
-		sched.ngsys.Add(1)
-	} else {
-		// Only user goroutines inherit synctest groups and pprof labels.
-		newg.bubble = callergp.bubble
-		if mp.curg != nil {
-			newg.labels = mp.curg.labels
-		}
-		if goroutineProfile.active {
-			// A concurrent goroutine profile is running. It should include
-			// exactly the set of goroutines that were alive when the goroutine
-			// profiler first stopped the world. That does not include newg, so
-			// mark it as not needing a profile before transitioning it from
-			// _Gdead.
-			newg.goroutineProfiled.Store(goroutineProfileSatisfied)
-		}
-	}
-	// Track initial transition?
-	newg.trackingSeq = uint8(cheaprand())
-	if newg.trackingSeq%gTrackingPeriod == 0 {
-		newg.tracking = true
-	}
-	gcController.addScannableStack(pp, int64(newg.stack.hi-newg.stack.lo))
 
-	// Get a goid and switch to runnable. Make all this atomic to the tracer.
-	trace := traceAcquire()
 	var status uint32 = _Grunnable
 	if parked {
 		status = _Gwaiting
 		newg.waitreason = waitreason
 	}
-	if pp.goidcache == pp.goidcacheend {
-		// Sched.goidgen is the last allocated id,
-		// this batch must be [sched.goidgen+1, sched.goidgen+GoidCacheBatch].
-		// At startup sched.goidgen=0, so main goroutine receives goid=1.
-		pp.goidcache = sched.goidgen.Add(_GoidCacheBatch)
-		pp.goidcache -= _GoidCacheBatch - 1
-		pp.goidcacheend = pp.goidcache + _GoidCacheBatch
-	}
 	newg.goid = pp.goidcache
 	casgstatus(newg, _Gdead, status)
-	pp.goidcache++
-	newg.trace.reset()
-	if trace.ok() {
-		trace.GoCreate(newg, newg.startpc, parked)
-		traceRelease(trace)
-	}
-
-	// Set up race context.
-	if raceenabled {
-		newg.racectx = racegostart(callerpc)
-		newg.raceignore = 0
-		if newg.labels != nil {
-			// See note in proflabel.go on labelSync's role in synchronizing
-			// with the reads in the signal handler.
-			racereleasemergeg(newg, unsafe.Pointer(&labelSync))
-		}
-	}
+	
+	
 	releasem(mp)
 
 	return newg
 }
 ```
 
+参数说明：
+
+- fn *funcval：要执行的函数（包含函数指针和闭包变量）
+- gp *g：父 goroutine（当前 goroutine）
+- pc uintptr：调用者的 PC（创建位置），即 go 语句的位置
+- false：parked 参数，表示新 goroutine 不是处于等待状态
+- waitReasonZero：等待原因（这里为0，因为不等待）
 
 
 
+Part 1:
+
+禁止当前 m 被抢占，绑定 m 和 p，从 p 的本地队列中获取空闲的 g，若没有则从全局队列中批量获取空闲的 g，仍然没有则创建一个 g，并分配栈空间，标记状态为 `_Gdead`，并添加到 allgs 中（全局变量，维持着所有的 g 数组，主要用来统计）
+
+```go
+mp := acquirem() // disable preemption because we hold M and P in local vars.
+pp := mp.p.ptr()
+newg := gfget(pp)
+if newg == nil {
+  newg = malg(stackMin)
+  casgstatus(newg, _Gidle, _Gdead) // 切换状态
+  allgadd(newg)	// 添加到全局数组 allgs    []*g
+}
+if newg.stack.hi == 0 {
+  throw("newproc1: newg missing stack")
+}
+
+if readgstatus(newg) != _Gdead {
+  throw("newproc1: new g is not Gdead")
+}
+
+//go:nosplit
+func acquirem() *m {
+	gp := getg()
+	gp.m.locks++  // 绑定 m 与 p，禁止抢占
+	return gp.m
+}
+```
+
+
+
+gfget 获取 g：
+
+- 优先从 pp.gFree.pop() 获取空闲的 g
+
+- retry 循环中不断从获取 sched.gFree 全局队列中获取空闲的 g，获取时优先获取那些已经分配了栈空间的 g
+- 为 g 分配栈空间，若已分配则判断其栈空间大小是否与起始栈空间大小一致，不一致则重新分配。
+
+```go
+// Get from gfree list.
+// If local list is empty, grab a batch from global list.
+func gfget(pp *p) *g {
+retry:
+	if pp.gFree.empty() && (!sched.gFree.stack.empty() || !sched.gFree.noStack.empty()) {
+		lock(&sched.gFree.lock)
+		// Move a batch of free Gs to the P.
+		for pp.gFree.size < 32 {
+			// 优先获取那些已经分配了栈空间的 g
+			gp := sched.gFree.stack.pop()
+			if gp == nil {
+				gp = sched.gFree.noStack.pop()
+				if gp == nil {
+					break
+				}
+			}
+			pp.gFree.push(gp)
+		}
+		unlock(&sched.gFree.lock)
+		goto retry
+	}
+	gp := pp.gFree.pop()
+	if gp == nil {
+		return nil
+	}
+  // 如果 g 已经分配了栈空间，并且栈空间大小不等于起始栈空间大小，需要重新分配，确保每个新使用的 g的栈空间都是从 startingStackSize（2KB，该值可设置调整） 开始
+	if gp.stack.lo != 0 && gp.stack.hi-gp.stack.lo != uintptr(startingStackSize) {
+		systemstack(func() {
+			stackfree(gp.stack)
+			gp.stack.lo = 0
+			gp.stack.hi = 0
+			gp.stackguard0 = 0
+		})
+	}
+	if gp.stack.lo == 0 {
+		// Stack was deallocated in gfput or just above. Allocate a new one.
+		systemstack(func() {
+			gp.stack = stackalloc(startingStackSize)
+		})
+		gp.stackguard0 = gp.stack.lo + stackGuard
+	}
+	return gp
+}
+```
+
+malg(stackMin)，p 本地队列和全局队列都没有空闲的 g 时，则新建 g
+
+```go
+// Allocate a new g, with a stack big enough for stacksize bytes.
+func malg(stacksize int32) *g {
+	newg := new(g)
+	if stacksize >= 0 {
+		stacksize = round2(stackSystem + stacksize)  // 按2的指数向上取整
+		systemstack(func() {
+			newg.stack = stackalloc(uint32(stacksize))
+		})
+		newg.stackguard0 = newg.stack.lo + stackGuard
+		newg.stackguard1 = ^uintptr(0)
+		// Clear the bottom word of the stack. We record g
+		// there on gsignal stack during VDSO on ARM and ARM64.
+		*(*uintptr)(unsafe.Pointer(newg.stack.lo)) = 0
+	}
+	return newg
+}
+```
+
+Part2: g结构体的各个字段值的赋值
+
+
+
+#### 2.3.3 runqput
+
+runqput 函数负责将一个 goroutine (gp) 放入 P (pp) 的本地可运行队列中。有两种放置模式：
+普通模式：将 goroutine 放到队列尾部
+next 模式：将 goroutine 放到 pp.runnext 槽位（优先执行）
+
+```go
+// runqput tries to put g on the local runnable queue.
+// If next is false, runqput adds g to the tail of the runnable queue.
+// If next is true, runqput puts g in the pp.runnext slot.
+// If the run queue is full, runnext puts g on the global queue.
+// Executed only by the owner P.
+func runqput(pp *p, gp *g, next bool) {
+	if !haveSysmon && next {
+		// A runnext goroutine shares the same time slice as the
+		// current goroutine (inheritTime from runqget). To prevent a
+		// ping-pong pair of goroutines from starving all others, we
+		// depend on sysmon to preempt "long-running goroutines". That
+		// is, any set of goroutines sharing the same time slice.
+		//
+		// If there is no sysmon, we must avoid runnext entirely or
+		// risk starvation.
+		next = false
+	}
+
+	if next {
+	retryNext:
+		oldnext := pp.runnext
+		if !pp.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
+			goto retryNext
+		}
+		if oldnext == 0 {
+			return
+		}
+		// Kick the old runnext out to the regular run queue.
+		gp = oldnext.ptr()
+	}
+
+retry:
+	h := atomic.LoadAcq(&pp.runqhead) // load-acquire, synchronize with consumers
+	t := pp.runqtail
+	if t-h < uint32(len(pp.runq)) {
+		pp.runq[t%uint32(len(pp.runq))].set(gp)
+		atomic.StoreRel(&pp.runqtail, t+1) // store-release, makes the item available for consumption
+		return
+	}
+	if runqputslow(pp, gp, h, t) {
+		return
+	}
+	goto retry
+}
+```
+
+如果本地队列已经放满了，那么就往全局队列中放。即调用 `runqputslow`，这里会将 p 一半的本地队列和当前 goroutine 批量转移到全局队列，批量操作，操作全局队列需要加锁。全局队列按照链表串联起来，无限容量，有锁，起一个兜底作用。
 
 
 
@@ -738,17 +884,276 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 
 
 
+汇编：
+
+```c
+// start this M，启动调度
+	CALL	runtime·mstart(SB)
+    
+TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME|NOFRAME,$0
+	CALL	runtime·mstart0(SB)
+	RET // not reached
+```
+
+在 runtime 中调用 mstart0，mstart0 中调用 mstart1，它的实现在 proc.go 中：
+
+```go
+func mstart1() {
+	gp := getg()
+
+	if gp != gp.m.g0 {
+		throw("bad runtime·mstart")
+	}
+  // 保存返回点，执行完后需要回到调用方的下一条语句上继续执行
+	gp.sched.g = guintptr(unsafe.Pointer(gp))
+	gp.sched.pc = sys.GetCallerPC()
+	gp.sched.sp = sys.GetCallerSP()	
+	
+  // 如果当前 m 不等于 m0，则需要绑定一个 p
+	if gp.m != &m0 {
+		acquirep(gp.m.nextp.ptr())
+		gp.m.nextp = 0
+	}
+	schedule()
+}
+```
+
+schedule()：开启GMP调度，不在返回，循环执行下去
+
+```go
+// One round of scheduler: find a runnable goroutine and execute it.
+// Never returns.
+func schedule() {
+	mp := getg().m
+
+	// 省略其他代码......
+
+top:
+	pp := mp.p.ptr()
+	pp.preempt = false
+
+	// Safety check: if we are spinning, the run queue should be empty.
+	// Check this before calling checkTimers, as that might call
+	// goready to put a ready goroutine on the local run queue.
+	if mp.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
+		throw("schedule: spinning with local work")
+	}
+	// 找到一个可执行的goroutine
+	gp, inheritTime, tryWakeP := findRunnable() // blocks until work is available
+
+	// 解除M自旋
+	if mp.spinning {
+		resetspinning()
+	}
+
+	// If about to schedule a not-normal goroutine (a GCworker or tracereader),
+	// wake a P if there is one.
+	if tryWakeP {
+		wakep()
+	}
+	// 执行 goroutine
+	execute(gp, inheritTime)
+}
+```
+
+#### 2.4.1 findRunnable()
+
+函数返回值，分别代表：
+
+- gp：找到的 goroutine
+- inheritTime：是否继承时间片
+- tryWakeP：是否需要唤醒其他 P
+
+findRunnable() 查找顺序：
+
+1. 清理和初始化
+   ├─ 清除 allp 快照
+   ├─ 检查 GC 等待 → gcstopm() → goto top
+   ├─ 检查安全点函数 → runSafePointFn()
+   └─ 检查定时器
+
+2. 特殊 goroutine（优先级最高）
+   ├─ Trace reader (tryWakeP=true)
+   └─ GC worker (tryWakeP=true)
+
+3. 全局队列公平性检查（每 61 次）
+   └─ schedtick % 61 == 0 → globrunqget()
+
+4. 唤醒特殊 goroutine
+   ├─ Finalizer goroutine
+   └─ GC cleanup goroutine
+
+5. 本地队列（快速路径）
+   └─ runqget(pp) → 优先检查 runnext
+
+6. 全局队列（批量获取）
+   └─ globrunqgetbatch() → 获取一半到本地队列
+
+7. 网络轮询（非阻塞）
+   └─ netpoll(0) → 检查就绪的网络 I/O
+
+8. 工作窃取
+   └─ stealWork() → 从其他 P 窃取
+
+9. 空闲 GC 标记
+   └─ 如果有 GC 工作，运行空闲标记
+
+10. 准备休眠
+    ├─ 释放 P
+    ├─ 再次检查所有队列
+    ├─ 网络轮询（阻塞）
+    └─ stopm() → 休眠 M
+
+
+
 
 
 ## 其他
 
+### 1 补充
+
+#### 1.1 g 栈空间分布：
+
+![sched_pidle](../images/goroutine栈分布.png)
+
+栈大小计算：
+`stack.hi - stack.lo = 2048 字节` (初始栈大小，即 stackMin)
+
+如果 `SP < stackguard0`:
+    触发栈增长（调用 runtime.morestack）
+    分配更大的栈
+    复制旧栈内容到新栈
+    继续执行
+
+除了栈溢出检测，stackguard0 还用于实现抢占。
+
+```go
+gp.stackguard0 = stackPreempt  // 0xfffffade（一个很大的值）
+```
+
+下次函数调用时：
+`SP (正常值) < stackPreempt (超大值)` → 触发 morestack
+morestack 检测到 `stackguard0 == stackPreempt`
+执行抢占逻辑而非栈增长
 
 
-### 1、GMP 模型的进化思想
+
+#### 1.2 goroutine 状态转换
+
+![goroutine状态转换图](../images/goroutine状态转换图.png)
+
+#### 1.3 抢占禁用p的next槽位
+
+```go
+// Goroutine A
+for {
+    ch <- 1  // 发送后立即阻塞，没有函数调用
+}
+
+// Goroutine B  
+for {
+    <-ch     // 接收后立即阻塞，没有函数调用
+}
+
+```
+
+上述例子中会出现 A B 互相唤醒，互相执行，继承 p 的时间片一直执行下去，导致 p 上的其他 g 处于饥饿状态，时间片一直会被刷新，是因为从 runqget 中获取 g 时，如果 next 有值，则优先返回，并且 `inheritTime = true`,标志继承时间片。
+
+```go
+func runqget(pp *p) (gp *g, inheritTime bool) {
+    // 如果 runnext 有值，优先返回它
+    if next != 0 && pp.runnext.cas(next, 0) {
+        return next.ptr(), true  // ← inheritTime = true
+    }
+    
+    // 否则从普通队列取
+    // ...
+    return gp, false  // ← inheritTime = false
+}
+```
+
+在调度器执行时，会判断 `inheritTime` 标识是否为 true，为 true 则调度器计数器不增加。
+
+```GO
+func execute(gp *g, inheritTime bool) {
+    mp := getg().m
+    // ... 省略其他代码 ...
+    if !inheritTime {
+        mp.p.ptr().schedtick++  // ← 只有 inheritTime=false 时才增加 schedtick
+    }
+    // ... 省略其他代码 ...
+    gogo(&gp.sched)  // 开始执行 goroutine
+}
+```
+
+因此，在 runqput 中如果没有系统监控主动抢占时，需要禁止 next。
+
+系统监控抢占是通过 sysmon 检查 pp.schedtick 是否变化来判断，如果 schedtick 长时间不变，说明时间片用完，触发抢占。
+
+```go
+// sysmon 每 10ms 检查一次
+func retake(now int64) uint32 {
+    // ...
+    if s == _Prunning || s == _Psyscall {
+        // Preempt G if it's running on the same schedtick for
+        // too long. This could be from a single long-running
+        // goroutine or a sequence of goroutines run via
+        // runnext, which share a single schedtick time slice.
+        t := int64(pp.schedtick)
+        if int64(pd.schedtick) != t {
+            pd.schedtick = uint32(t)
+            pd.schedwhen = now
+        } else if pd.schedwhen+forcePreemptNS <= now {
+            preemptone(pp)  // ← 抢占
+        }
+    }
+    // ...
+}
+```
+
+
+
+#### 1.4 完整启动流程
+
+时间线：
+T0: 程序启动
+    ↓
+T1: 汇编入口（asm_amd64.s）
+    ├─ mainStarted = false（默认值）
+    ├─ newproc(runtime.main)  <-创建 main goroutine
+    │   ├─ runqput(P0, main_g, true)  <-放入 runnext
+    │   └─ if mainStarted { wakep() }  <-不执行！
+    └─ mstart()  <-启动 M0
+    
+T2: M0 进入调度循环
+    ├─ mstart0()
+    ├─ mstart1()
+    └─ schedule()  <-永不返回
+    
+T3: schedule() 查找 goroutine
+    ├─ findRunnable()
+    ├─ runqget(P0)  <-从 runnext 取出 main goroutine
+    └─ execute(main_g, inheritTime=true)  <-继承时间片
+    
+T4: 执行 runtime.main
+    ├─ mainStarted = true
+    ├─ 启动 sysmon
+    ├─ 执行 init 函数
+    └─ 执行 main.main()  ← 执行用户代码
+    
+T5: 用户代码中创建 goroutine
+    ├─ go func() { ... }
+    ├─ newproc(fn)
+    ├─ runqput(P0, new_g, true)
+    └─ if mainStarted { wakep() }  <-唤醒 m 执行 g
+
+
+
+### 2 GMP 模型的进化思想
 
 在高并发场景下，大量的线程创建、使用、切换、销毁会占用大量的内存，并浪费 CPU 时间工作在非工作任务的上，导致程序并发处理请求的能力降低。
 
-### 2、GMP 生态
+### 3 GMP 生态
 
 go 语言中的并发工具都是以 G 为并发粒度打造的，围绕GMP构造的并发世界
 
