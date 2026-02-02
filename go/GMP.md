@@ -66,6 +66,10 @@ p 维护在一个 p 列表中，最大数目由 GOMAXPROCS 决定，可通过环
 
 
 
+![GMP架构图](../images/GMP结构体.png)
+
+
+
 
 全局唯一的一个 m0，就是进程的主线程，拉起 main 函数这个 groutine。
 
@@ -882,6 +886,10 @@ retry:
 
 ### 2.4 启动 GMP 调度循环
 
+整体流程：
+
+![sched_pidle](../images/findRunnable流程图.png)
+
 
 
 汇编：
@@ -1003,6 +1011,878 @@ findRunnable() 查找顺序：
     ├─ 再次检查所有队列
     ├─ 网络轮询（阻塞）
     └─ stopm() → 休眠 M
+
+
+
+```go
+func findRunnable() (gp *g, inheritTime, tryWakeP bool) {
+	mp := getg().m
+top:
+  // 获取 p
+	pp := mp.p.ptr()
+	if sched.gcwaiting.Load() {
+		gcstopm()
+		goto top
+	}
+  if gcBlackenEnabled != 0 {
+		gp, tnow := gcController.findRunnableGCWorker(pp, now)
+		if gp != nil {
+			return gp, false, true
+		}
+		now = tnow
+	}
+  // 每 61 次调度，需要尝试处理一次全局队列 (防止饥饿)
+	if pp.schedtick%61 == 0 && !sched.runq.empty() {
+		lock(&sched.lock)
+		gp := globrunqget()
+		unlock(&sched.lock)
+		if gp != nil {
+			return gp, false, false
+		}
+	}
+  
+  // local runq
+	if gp, inheritTime := runqget(pp); gp != nil {
+		return gp, inheritTime, false
+	}
+
+	// global runq
+	if !sched.runq.empty() {
+		lock(&sched.lock)
+		gp, q := globrunqgetbatch(int32(len(pp.runq)) / 2)
+		unlock(&sched.lock)
+		if gp != nil {
+			if runqputbatch(pp, &q); !q.empty() {
+				throw("Couldn't put Gs into empty local runq")
+			}
+			return gp, false, false
+		}
+	}
+  
+  // 从网络就绪io中读取，netpoll，返回io就绪的 g
+  if netpollinited() && netpollAnyWaiters() && sched.lastpoll.Load() != 0 && sched.pollingNet.Swap(1) == 0 {
+		list, delta := netpoll(0)
+		sched.pollingNet.Store(0)
+		if !list.empty() { // non-blocking
+			gp := list.pop()
+			injectglist(&list)
+			netpollAdjustWaiters(delta)
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			return gp, false, false
+		}
+	}
+  
+  // Spinning Ms: steal work from other Ps.
+	//
+	// Limit the number of spinning Ms to half the number of busy Ps.
+	// This is necessary to prevent excessive CPU consumption when
+	// GOMAXPROCS>>1 but the program parallelism is low.
+	if mp.spinning || 2*sched.nmspinning.Load() < gomaxprocs-sched.npidle.Load() {
+		if !mp.spinning {
+			mp.becomeSpinning()
+		}
+		// 窃取其他 p 的 g
+		gp, inheritTime, tnow, w, newWork := stealWork(now)
+		if gp != nil {
+			// Successfully stole.
+			return gp, inheritTime, false
+		}
+	}
+  .......
+  
+  // We have nothing to do.
+	// 若存在 gc 并发标记任务，做GC标记工作，好过直接回收 p
+	// If we're in the GC mark phase, can safely scan and blacken objects,
+	// and have work to do, run idle-time marking rather than give up the P. 
+	if gcBlackenEnabled != 0 && gcMarkWorkAvailable(pp) && gcController.addIdleMarkWorker() {
+		node := (*gcBgMarkWorkerNode)(gcBgMarkWorkerPool.pop())
+		if node != nil {
+			pp.gcMarkWorkerMode = gcMarkWorkerIdleMode
+			gp := node.gp.ptr()
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			return gp, false, false
+		}
+		gcController.removeIdleMarkWorker()
+	}
+  // 加全局锁，并 double check 全局队列是否有 g
+	lock(&sched.lock)
+	// ...
+	if sched.runqsize != 0 {
+		gp := globrunqget(_p_, 0)
+		unlock(&sched.lock)
+		return gp, false, false
+	}
+  
+  // 确认当前 p 无事可做，则将 p 和 m 解绑，并将其添加到全局调度模块 schedt 中的空闲 p 队列 pidle 中 
+  if releasep() != pp {
+		throw("findrunnable: wrong p")
+	}
+	now = pidleput(pp, now)
+	unlock(&sched.lock)
+  ......
+  // 走到此处仍然未找到合适的 g 用于调度，则需要将 m block 住，添加到 schedt 的 midle 中
+  stopm()
+	goto top
+}
+```
+
+**1、从本地队列lrq获取g**
+
+```go
+func runqget(pp *p) (gp *g, inheritTime bool) {
+	// If there's a runnext, it's the next G to run.
+	next := pp.runnext
+	if next != 0 && pp.runnext.cas(next, 0) {
+		return next.ptr(), true
+	}
+	// 尝试基于 cas 操作，获取本地队列头节点中的 g
+	for {
+		h := atomic.LoadAcq(&pp.runqhead) // load-acquire, synchronize with other consumers
+		t := pp.runqtail
+    // 头尾相等，说明队列为空
+		if t == h {
+			return nil, false
+		}
+    // 取出头节点
+		gp := pp.runq[h%uint32(len(pp.runq))].ptr()
+    // 通过 cas 操作更新头节点索引
+		if atomic.CasRel(&pp.runqhead, h, h+1) { // cas-release, commits consume
+			return gp, false
+		}
+	}
+}
+```
+
+**2、从全局队列中获取g**
+
+```go
+// A gQueue is a dequeue of Gs linked through g.schedlink. A G can only
+// be on one gQueue or gList at a time.
+type gQueue struct {
+	head guintptr
+	tail guintptr
+	size int32
+}
+
+func globrunqgetbatch(n int32) (gp *g, q gQueue) {
+	assertLockHeld(&sched.lock)
+	// 为空直接返回
+	if sched.runq.size == 0 {
+		return
+	}
+	// 据传入的 max 值尝试获取 grq 中的半数 g 填充到 p 的 lrq 中
+	n = min(n, sched.runq.size, sched.runq.size/gomaxprocs+1)
+
+	gp = sched.runq.pop()
+	n--
+
+	for ; n > 0; n-- {
+		gp1 := sched.runq.pop()
+		q.pushBack(gp1)
+	}
+	return
+}
+// 批量存放到p的本地队列
+func runqputbatch(pp *p, q *gQueue) {
+	if q.empty() {
+		return
+	}
+	h := atomic.LoadAcq(&pp.runqhead)
+	t := pp.runqtail
+	n := uint32(0)
+	for !q.empty() && t-h < uint32(len(pp.runq)) {
+		gp := q.pop()
+		pp.runq[t%uint32(len(pp.runq))].set(gp)
+		t++
+		n++
+	}
+  // 更新尾节点
+	atomic.StoreRel(&pp.runqtail, t)
+	return
+}
+```
+
+**3、获取io就绪的g**
+
+以非阻塞模式下的 epoll_wait 操作获取 io 就绪的 g。 该方法位于 runtime/netpoll_epoll.go，是 Linux 平台上基于 epoll 实现的网络轮询器核心函数
+
+```go
+// netpoll checks for ready network connections.
+// Returns a list of goroutines that become runnable,
+// and a delta to add to netpollWaiters.
+// This must never return an empty list with a non-zero delta.
+//
+// delay < 0: blocks indefinitely 无限期阻塞
+// delay == 0: does not block, just polls
+// delay > 0: block for up to that many nanoseconds 阻塞纳秒数
+func netpoll(delay int64) (gList, int32) {
+	.......
+	var events [128]linux.EpollEvent
+retry:
+	n, errno := linux.EpollWait(epfd, events[:], int32(len(events)), waitms)
+	......
+  // 遍历所有就绪的事件
+	var toRun gList
+	delta := int32(0)
+	for i := int32(0); i < n; i++ {
+		ev := events[i]
+		if ev.Events == 0 {
+			continue
+		}
+
+		if *(**uintptr)(unsafe.Pointer(&ev.Data)) == &netpollEventFd {
+			if ev.Events != linux.EPOLLIN {
+				println("runtime: netpoll: eventfd ready for", ev.Events)
+				throw("runtime: netpoll: eventfd ready for something unexpected")
+			}
+			continue
+		}
+		// 调用 netpollready 唤醒等待的 goroutine
+    if pd.fdseq.Load() == tag {
+      pd.setEventErr(ev.Events == linux.EPOLLERR, tag)
+      delta += netpollready(&toRun, pd, mode)
+    }
+		
+	}
+	return toRun, delta
+}
+```
+
+**4、从其他p处窃取g**
+
+```go
+func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
+	pp := getg().m.p.ptr()
+
+	const stealTries = 4
+	for i := 0; i < stealTries; i++ {
+		// 通过随机数以随机起点随机步长选取目标 p 进行窃取，实现方式是stealOrder保存着p的总数count，和与count互质的数，如果 X 和 N 互质，序列 (i + X) % N 会不重复地遍历 0 到 N-1 的所有数字，实现随机性
+		for enum := stealOrder.start(cheaprand()); !enum.done(); enum.next() {
+			// 获取要窃取的p
+			p2 := allp[enum.position()]
+			if pp == p2 {
+				continue
+			}
+			// Don't bother to attempt to steal if p2 is idle.
+			if !idlepMask.read(enum.position()) {
+        // 窃取目标 p2，其中会尝试将目标 p2 lrq 中半数 g 窃取到当前 p 的 lrq 中
+				if gp := runqsteal(pp, p2, stealTimersOrRunNextG); gp != nil {
+					return gp, false, now, pollUntil, ranTimer
+				}
+			}
+		}
+	}
+	// 窃取失败
+	return nil, false, now, pollUntil, ranTimer
+}
+```
+
+**5、释放p和m**
+
+```go
+func releasep() *p {
+	return releasepNoTrace()
+}
+
+func releasepNoTrace() *p {
+	gp := getg()
+
+	if gp.m.p == 0 {
+		throw("releasep: invalid arg")
+	}
+	pp := gp.m.p.ptr()
+	if pp.m.ptr() != gp.m || pp.status != _Prunning {
+		print("releasep: m=", gp.m, " m->p=", gp.m.p.ptr(), " p->m=", hex(pp.m), " p->status=", pp.status, "\n")
+		throw("releasep: invalid p state")
+	}
+	gp.m.p = 0
+	pp.m = 0
+	pp.status = _Pidle
+	return pp
+}
+
+//go:nowritebarrierrec
+func pidleput(pp *p, now int64) int64 {
+	assertLockHeld(&sched.lock)
+	if !runqempty(pp) {
+		throw("pidleput: P has non-empty run queue")
+	}
+	if now == 0 {
+		now = nanotime()
+	}
+	if pp.timers.len.Load() == 0 {
+		timerpMask.clear(pp.id)
+	}
+	idlepMask.set(pp.id)
+	pp.link = sched.pidle
+	sched.pidle.set(pp)
+	sched.npidle.Add(1)
+	return now
+}
+```
+
+
+
+stopm:
+
+```go
+// Stops execution of the current m until new work is available.
+// Returns with acquired P.
+func stopm() {
+	gp := getg()
+
+	if gp.m.locks != 0 {
+		throw("stopm holding locks")
+	}
+	if gp.m.p != 0 {
+		throw("stopm holding p")
+	}
+	if gp.m.spinning {
+		throw("stopm spinning")
+	}
+
+	lock(&sched.lock)
+  // 放入schd的全局空闲m队列
+	mput(gp.m)
+	unlock(&sched.lock)
+  // 阻塞m
+	mPark()
+  // mPark返回后意味着 m 唤醒尝试获取p
+	acquirep(gp.m.nextp.ptr())
+	gp.m.nextp = 0
+}
+```
+
+
+
+#### 2.4.2 execute
+
+gmp调度的最后一公里，完成从调度器到用户代码的最后一跳
+
+```go
+// 执行给定的 g. 当前执行方还是 g0，但会通过 gogo 方法切换至 gp
+func execute(gp *g, inheritTime bool) {
+  // 获取m
+	mp := getg().m
+
+	// Assign gp.m before entering _Grunning so running Gs have an M.
+	mp.curg = gp  // 指定当前m运行的g
+	gp.m = mp		// g绑定的m
+	
+  // 切换到运行态
+	casgstatus(gp, _Grunnable, _Grunning)
+
+	gp.preempt = false	//清除抢占标识
+	gp.stackguard0 = gp.stack.lo + stackGuard	// 设置栈边界
+  // 不是继承p的时间片时，调度次数加1
+	if !inheritTime {
+		mp.p.ptr().schedtick++
+	}
+	// g0切换至g，运行用户g，通过汇编实现，不会返回了，goroutine 执行完毕后会调用 goexit()，在goexit会再次调用schedule()
+	gogo(&gp.sched)
+}
+
+// func gogo(buf *gobuf)
+// restore state from Gobuf; longjmp
+TEXT runtime·gogo(SB), NOSPLIT, $0-8
+	MOVQ	buf+0(FP), BX		// BX = gobuf 地址
+	MOVQ	gobuf_g(BX), DX	// DX = gp
+	MOVQ	0(DX), CX		// make sure g != nil
+	JMP	gogo<>(SB)
+
+TEXT gogo<>(SB), NOSPLIT, $0
+	get_tls(CX)
+	MOVQ	DX, g(CX)	// 设置 TLS 中的 g
+	MOVQ	DX, R14		// set the g register
+	MOVQ	gobuf_sp(BX), SP	// restore SP 恢复栈指针
+	MOVQ	gobuf_ctxt(BX), DX
+	MOVQ	gobuf_bp(BX), BP
+	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector
+	MOVQ	$0, gobuf_ctxt(BX)
+	MOVQ	$0, gobuf_bp(BX)
+	MOVQ	gobuf_pc(BX), BX	// BX = 要跳转的 PC
+	JMP	BX
+```
+
+用户 g 的一个生命周期大致如下：
+
+```bash
+创建 -> _Grunnable -> execute() -> _Grunning -> 用户代码执行 -> goexit() -> goexit0() -> schedule() -> execute(下一个 G)
+```
+
+
+
+## 3、让渡设计
+
+### 3.1 g执行完后让渡
+
+g 执行完后退出
+
+自动调用 runtime·goexit，进而 runtime·goexit1，在 runtime·goexit1 中通过 `mcall(goexit0) `切换到 g0，调用goexit0
+
+```go
+TEXT runtime·goexit(SB),NOSPLIT|TOPFRAME|NOFRAME,$0-0
+	BYTE	$0x90	// NOP
+	CALL	runtime·goexit1(SB)	// does not return
+
+// goexit continuation on g0.
+func goexit0(gp *g) {
+	gdestroy(gp)
+	schedule()
+}
+```
+
+```go
+func gdestroy(gp *g) {
+	mp := getg().m
+	pp := mp.p.ptr()
+	// 状态切换
+	casgstatus(gp, _Grunning, _Gdead)
+	
+  // 解除 M ↔ G 的关联
+	gp.m = nil
+	locked := gp.lockedm != 0
+	gp.lockedm = 0
+	mp.lockedg = 0
+  // 清理 goroutine 的各种字段
+	gp.preemptStop = false
+	gp.paniconfault = false
+	gp._defer = nil // should be true already but just in case.
+	gp._panic = nil // non-nil for Goexit during panic. points at stack-allocated data.
+	gp.writebuf = nil
+	gp.waitreason = waitReasonZero
+	gp.param = nil
+	gp.labels = nil
+	gp.timer = nil
+	
+  // 解除当前 M 和 G 的关联，清除双向指针：M.curg 和 G.m
+	dropg()
+  // 加入到 p 的本地空闲 gFree队列，当创建新的 goroutine 时（newproc1），会先从空闲列表获取
+	gfput(pp, gp)
+	
+}
+```
+
+
+
+### 3.2 g主动让渡
+
+g主动让渡指的是由用户手动调用 runtime.Gosched 方法让出 g 所持有的执行权。在 Gosched 方法中，会通过 mcall 指令切换至 g0，并由 g0 执行 gosched_m 方法，其中包含如下步骤：
+
+- 将 g 由 running 改为 runnable 状态
+- 解除 g 和 m 的关系
+- 将 g 直接添加到全局队列 grq 中
+- 调用 schedule 方法发起新一轮调度
+
+```go
+// 主动让渡出执行权，此时执行方还是普通 g
+func Gosched() {
+  // 通过 mcall，将执行方转为 g0，调用 gosched_m 方法
+	mcall(gosched_m)
+}
+
+
+// 将 gp 切换回就绪态后添加到全局队列 grq，并发起新一轮调度
+// 此时执行方为 g0
+func gosched_m(gp *g) {
+	// ...
+	goschedImpl(gp)
+}
+
+func goschedImpl(gp *g) {
+  // 将 g 状态由 running 改为 runnable 就绪态
+	casgstatus(gp, _Grunning, _Grunnable)
+  // 解除 g 和 m 的关系
+	dropg()
+  // 将 g 添加到全局队列 grq
+	lock(&sched.lock)
+	globrunqput(gp)
+	unlock(&sched.lock)
+  // 发起新一轮调度
+	schedule()
+}
+```
+
+
+
+### 3.3 g阻塞让渡
+
+G阻塞让渡指的是 g 在执行过程中有需要等待的外部资源，需要进入阻塞等待的状态（waiting），直到条件达成后才能完成将状态重新更新为就绪态（runnable），如：Channel 操作阻塞、Select 语句阻塞、网络 I/O 等待
+
+通过 runtime/proc.go 的 gopark 方法实现：
+
+- 通过 mcall 从 g 切换至 g0，并由 g0 执行 park_m 方法
+- g0 将 g 由 running 更新为 waiting 状态，然后发起新一轮调度
+
+```go
+// 此时执行方为普通 g
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
+  // 获取 m 正在执行的 g，也就是要阻塞让渡的 g
+  mp := acquirem()
+	gp := mp.curg
+	.......
+  // 通过 mcall，将执行方由普通 g -> g0
+	mcall(park_m)
+}
+
+// 此时执行方为 g0. 入参 gp 为需要执行 park 的普通 g
+func park_m(gp *g) {
+  // 获取 m
+	mp := getg().m
+	// 将 gp 状态由 running 变更为 waiting
+	casgstatus(gp, _Grunning, _Gwaiting)
+  // 解绑 g 与 m 的关系
+	dropg()
+	// g0 发起新一轮调度流程
+	schedule()
+}
+```
+
+相反，唤醒 g 的方法是 goready 方法，通过 systemstack 压栈切换至 g0 执行 ready 方法——将目标 g 状态由 waiting 改为 runnable，然后添加到就绪队列中。
+
+```go
+// 此时执行方为普通 g. 入参 gp 为需要唤醒的另一个普通 g
+func goready(gp *g, traceskip int) {
+ // 调用 systemstack 后，会切换至 g0 调用传入的 ready 方法. 调用结束后则会直接切换回到当前普通 g 继续执行. 
+	systemstack(func() {
+		ready(gp, traceskip, true)
+	})
+	// 恢复成普通 g 继续执行 ...
+}
+
+// 此时执行方为 g0. 入参 gp 为拟唤醒的普通 g
+func ready(gp *g, traceskip int, next bool) {
+	mp := acquirem()
+	casgstatus(gp, _Gwaiting, _Grunnable)
+  /*
+      1) 优先将目标 g 添加到当前 p 的本地队列 lrq
+      2）若 lrq 满了，则将 g 追加到全局队列 grq
+  */
+	runqput(mp.p.ptr(), gp, next)
+  // 如果有 m 或 p 处于 idle 状态，将其唤醒
+	wakep()
+}
+```
+
+
+
+## 4、抢占设计
+
+抢占和让渡有相同之处，都表示由 g->g0 的流转过程，但区别在于，让渡是由 g 主动发起的（第一人称），而抢占则是由外力干预（sysmon thread监控线程）发起的（第三人称）。
+
+程序启动创建 main goroutine时，在运行时的 main 函数中，会启动一个全局唯一的监控线程 sysmon thread，定时执行监控工作，包括：
+
+- 从网络轮询中将就绪的 g 放到运行队列
+- retake 抢占长时间运行的 Goroutine 和夺回阻塞的 P
+
+```go
+func main() {
+  mainStarted = true
+
+  if haveSysmon {
+      systemstack(func() {
+          newm(sysmon, nil, -1)  // 通过newm创建新线程，执行sysmon函数，ID 为 -1，标记为系统线程
+      })
+  }
+}
+```
+
+```go
+// Always runs without a P, so write barriers are not allowed.
+//go:nowritebarrierrec
+func sysmon() {
+	lock(&sched.lock)
+	sched.nmsys++ // 增加系统 M 计数
+	unlock(&sched.lock)
+  ......
+
+	for {
+		// 根据闲忙情况调整轮询间隔，在空闲情况下 10 ms 轮询一次
+    if idle == 0 {
+        delay = 20  // 开始时睡眠 20 微秒
+    } else if idle > 50 {
+        delay *= 2  // 1ms 后开始加倍睡眠时间
+    }
+    if delay > 10*1000 {
+        delay = 10 * 1000  // 最多睡眠 10ms
+    }
+    usleep(delay)
+    // 将就绪的网络 goroutine 重新放入运行队列
+		// poll network if not polled for more than 10ms
+		lastpoll := sched.lastpoll.Load()
+		if netpollinited() && lastpoll != 0 && lastpoll+10*1000*1000 < now {
+			sched.lastpoll.CompareAndSwap(lastpoll, now)
+			list, delta := netpoll(0) // non-blocking - returns list of goroutines
+			if !list.empty() {
+				incidlelocked(-1)
+				injectglist(&list)
+				incidlelocked(1)
+				netpollAdjustWaiters(delta)
+			}
+		}
+		// 抢占长时间运行的 Goroutine 和夺回阻塞的 P
+		// retake P's blocked in syscalls
+		// and preempt long running G's
+		if retake(now) != 0 {
+			idle = 0	// 有工作被抢占，重置空闲计数
+		} else {
+			idle++
+		}
+		// check if we need to force a GC
+		if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && forcegc.idle.Load() {
+			....
+		}
+		unlock(&sched.sysmonlock)
+	}
+}
+```
+
+
+
+下面主要关注 retake：
+
+```go
+func retake(now int64) uint32 {
+    n := 0
+    for i := 0; i < len(allp); i++ {
+        pp := allp[i]
+        pd := &pp.sysmontick
+        s := pp.status
+        
+        // 情况 1: P 正在运行或在系统调用中
+        if s == _Prunning || s == _Psyscall {
+            t := int64(pp.schedtick)
+            if int64(pd.schedtick) != t {
+                // schedtick 变化了，说明有新的 G 在运行
+                pd.schedtick = uint32(t)
+                pd.schedwhen = now
+            } else if pd.schedwhen+forcePreemptNS <= now {
+                // 同一个 G 运行超过 10ms，抢占它
+                preemptone(pp)
+                sysretake = true
+            }
+        }
+        
+        // 情况 2: P 在系统调用中
+        if s == _Psyscall {
+            t := int64(pp.syscalltick)
+            if !sysretake && int64(pd.syscalltick) != t {
+                pd.syscalltick = uint32(t)
+                pd.syscallwhen = now
+                continue
+            }
+            
+            // 系统调用超过 20us，且有其他工作要做
+            if runqempty(pp) && sched.nmspinning.Load()+sched.npidle.Load() > 0 
+                && pd.syscallwhen+10*1000*1000 > now {
+                continue  // P 的队列为空，不夺回
+            }
+            
+            // 夺回 P
+            if atomic.Cas(&pp.status, s, _Pidle) {
+                n++
+                pp.syscalltick++
+                handoffp(pp)  // 将 P 交给其他 M
+            }
+        }
+    }
+    return uint32(n)
+}
+```
+
+两种抢占场景：
+场景 A：抢占长时间运行的 Goroutine
+
+场景 B：夺回阻塞在系统调用中的 P
+
+
+### 4.1 超时抢占
+
+时间阈值：10 毫秒（forcePreemptNS = 10 * 1000 * 1000）
+触发条件：同一个 G（或通过 runnext 共享时间片的 G 序列）运行超过 10ms
+抢占方式：
+
+```go
+func preemptone(pp *p) bool {
+  	mp := pp.m.ptr()
+  	// 获取 p 上正在执行的 g（抢占目标）
+    gp := mp.curg
+    gp.preempt = true
+    gp.stackguard0 = stackPreempt  // 设置栈边界为stackPreempt，当g执行时触发栈检查。
+    
+    // 异步抢占（发送信号）会对目标 g 所在的 m 发送抢占信号 sigPreempt，通过改写 g 程序计数器（pc，program counter）的方式将 g 逼停
+    if preemptMSupported && debug.asyncpreemptoff == 0 {
+        pp.preempt = true
+        preemptM(mp)  // 发送 SIGURG 信号
+    }
+    return true
+}
+// 发送抢占信号
+func preemptM(mp *m) {
+  .......
+	if mp.signalPending.CompareAndSwap(0, 1) {
+		signalM(mp, sigPreempt)
+	}
+}
+func signalM(mp *m, sig int) {
+	pthread_kill(pthread(mp.procid), uint32(sig))
+}
+```
+
+
+
+
+
+
+### 4.2 系统调用抢占
+
+在发起系统调用时，会执行位于 runtime/proc.go 的 reentersyscall 方法，此方法核心步骤包括：
+
+- 将 g 和 p 的状态更新为 syscall
+- 解除 p 和 m 的绑定
+- 将 p 设置为 m.oldp，保留 p 与 m 之间的弱联系（使得 m syscall 结束后，还有一次尝试复用 p 的机会）
+
+```go
+func reentersyscall(pc, sp uintptr) {
+  // 获取 g
+	gp := getg()
+	// 保存寄存器信息
+	save(pc, sp)
+	// ...
+  // 将 g 状态更新为 syscall
+	casgstatus(_g_, _Grunning, _Gsyscall)
+	// ...
+  // 解除 p 与 m 绑定关系
+	pp := gp.m.p.ptr()
+	pp.m = 0
+  // 将 p 设置为 m 的 oldp
+	gp.m.oldp.set(pp)
+	gp.m.p = 0
+  // 将 p 状态更新为 syscall
+	atomic.Store(&pp.status, _Psyscall)
+}
+```
+
+
+
+当系统系统调用完成时，会执行位于 runtime/proc.go 的 exitsyscall 方法（此时执行方还是 m 上的 g），包含如下步骤：
+
+- 检查 syscall 期间，p 是否未和其他 m 结合，如果是的话，直接复用 p，继续执行 g
+- 通过 mcall 操作切换至 g0 执行 exitsyscall0 方法，尝试为当前 m 结合一个新的 p，如果结合成功，则继续执行 g，否则将 g 添加到 grq 后暂停 m
+
+```go
+func exitsyscall() {
+  // 获取 g
+	gp := getg()
+
+	// ...
+
+	// 如果 oldp 没有和其他 m 结合，则直接复用 oldp
+	oldp := _g_.m.oldp.ptr()
+	_g_.m.oldp = 0
+	if exitsyscallfast(oldp) {
+		// ...
+    // 将 g 状态由 syscall 更新回 running
+		casgstatus(_g_, _Gsyscall, _Grunning)
+	 // ...
+		return
+	}
+	// 切换至 g0 调用 exitsyscall0 方法
+	mcall(exitsyscall0)
+}
+```
+
+
+
+```go
+// 此时执行方为 m 下的 g0
+func exitsyscall0(gp *g) {
+  // 将 g 的状态修改为 runnable 就绪态
+	casgstatus(gp, _Gsyscall, _Grunnable)
+   // 解除 g 和 m 的绑定关系
+	dropg()
+	lock(&sched.lock)
+  // 尝试寻找一个空闲的 p 与当前 m 结合
+	var pp *p
+	if schedEnabled(gp) {
+		pp, _ = pidleget(0)
+	}
+	var locked bool
+        // 如果与 p 结合失败，则将 g 添加到全局队列中
+	if pp == nil {
+		globrunqput(gp)
+		// ...
+	} 
+  // ...
+	unlock(&sched.lock)
+  // 如果与 p 结合成功，则继续调度 g 
+	if pp != nil {
+		acquirep(pp)
+		execute(gp, false) // Never returns.
+	}
+	// ...
+  // 与 p 结合失败的话，需要将当前 m 添加到 schedt 的 midle 队列并停止 m
+	stopm()
+  // 如果 m 被重新启用，则发起新一轮调度
+	schedule() // Never returns.
+}
+```
+
+
+
+回到 sysmon thread 中的 retake 方法，此处会遍历每个 p，并针对正在发起系统调用的 p 执行如下检查逻辑：
+
+- 检查 p 的 lrq 中是否存在等待执行的 g
+- 检查 p 的 syscall 时长是否 >= 10ms
+
+处理方式：
+将 P 的状态改为 _Pidle
+调用 handoffp(pp) 将 P 交给其他 M 使用
+原来的 M 从系统调用返回后会寻找新的 P
+
+```go
+func retake(now int64) uint32 {
+	// 情况 2: P 在系统调用中
+      if s == _Psyscall {
+          t := int64(pp.syscalltick)
+          if !sysretake && int64(pd.syscalltick) != t {
+              pd.syscalltick = uint32(t)
+              pd.syscallwhen = now
+              continue
+          }
+
+          // 系统调用超过 20us，且有其他工作要做
+          if runqempty(pp) && sched.nmspinning.Load()+sched.npidle.Load() > 0 
+              && pd.syscallwhen+10*1000*1000 > now {
+              continue  // P 的队列为空，不夺回
+          }
+
+          // 夺回 P
+          if atomic.Cas(&pp.status, s, _Pidle) {
+              n++
+              pp.syscalltick++
+              handoffp(pp)  // 将 P 交给其他 M
+          }
+      }
+}
+```
+
+
+
+```go
+func handoffp(_p_ *p) {
+	// 如果 p lrq 中还有 g 或者全局队列 grq 中还有 g，则立即分配一个新 m 与该 p 结合
+	if !runqempty(_p_) || sched.runqsize != 0 {
+                // 分配一个 m 与 p 结合
+		startm(_p_, false)
+		return
+	}
+	// ...
+        // 若系统空闲没有 g 需要调度，则将 p 添加到 schedt 中的空闲 p 队列 pidle 中
+	pidleput(_p_, 0)
+	// ...
+}
+```
 
 
 
@@ -1146,6 +2026,27 @@ T5: 用户代码中创建 goroutine
     ├─ newproc(fn)
     ├─ runqput(P0, new_g, true)
     └─ if mainStarted { wakep() }  <-唤醒 m 执行 g
+
+
+
+#### 1.5 一个阻塞 channel 的生命周期
+
+1. Goroutine 尝试从空 channel 接收
+2. 发现没有数据，需要阻塞
+3. 调用 gopark() → mcall(park_m)
+4. park_m():
+   - casgstatus(gp, _Grunning, _Gwaiting)  // 状态转换
+   - dropg()                                // 解除 M ↔ G 关联
+   - schedule()                             // 调度下一个 goroutine
+5. M 继续执行其他 goroutine
+6. 另一个 goroutine 向 channel 发送数据
+7. 调用 goready(gp) 唤醒阻塞的 goroutine
+8. gp 被放入运行队列
+9. 某个 M 通过 schedule() → findrunnable() 获取 gp
+10. execute(gp):
+    - mp.curg = gp    // 重新建立 M → G 关联
+    - gp.m = mp       // 重新建立 G → M 关联
+    - gogo(&gp.sched) // 恢复执行
 
 
 
